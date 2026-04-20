@@ -7,7 +7,7 @@
 \usepackage{algorithm}
 \usepackage{algorithmic}
 
-\title{Beating Apple Silicon with RAM:\\Frequency-Aware Expert Caching and GPU-Predicted\\Prefetch for MoE Inference on Consumer Hardware}
+\title{Running a 397B MoE Model on Dual Consumer GPUs:\\3-Tier Expert Caching Beats llama.cpp by 17\%}
 
 \author{
 \IEEEauthorblockN{Anonymous}
@@ -18,25 +18,25 @@
 \maketitle
 
 \begin{abstract}
-Mixture-of-Experts (MoE) models achieve remarkable parameter efficiency by activating only a small subset of experts per token, but their massive expert weights (hundreds of gigabytes) create severe I/O bottlenecks during inference. Prior work addresses this through expert prediction and prefetching, yet all existing approaches treat expert loading as a binary hit-or-miss problem. We present \textbf{Frequency-Aware Expert Caching (FAEC)}, a system that exploits two key observations: (1) expert activation follows a highly non-uniform distribution (Gini coefficient 0.23--0.47), enabling effective frequency-based caching, and (2) consumer desktop hardware with large RAM (125GB) can cache sufficient experts to eliminate most SSD accesses, despite having 5$\times$ slower SSD than Apple Silicon. Combined with dedicated GPU expert prediction, our system achieves \textbf{5.55 tokens/second} on Qwen3.5-35B-A3B using a consumer desktop PC with two RTX 3060 GPUs---\textbf{27\% faster} than Flash-MoE's 4.36 tok/s on a MacBook Pro M3 Max---while maintaining lossless bf16 precision. We further show that SVD-based expert decomposition is fundamentally unsuitable for MoE weights (rank-64 captures only 47\% energy), motivating our caching-first approach.
+Mixture-of-Experts (MoE) models achieve strong performance by activating only a small subset of experts per token, but their massive weight files create severe I/O bottlenecks on consumer hardware. We describe a system for running Qwen3.5-397B-A17B (397 billion parameters, 120GB on disk at 2-bit quantization) on two consumer NVIDIA RTX 3060 GPUs (24GB total VRAM) with 96GB DDR4 RAM. Our 3-tier expert cache---GPU VRAM (57\% hit), CPU pinned RAM (43\% hit), SSD (0.1\% miss)---achieves \textbf{1.35 tokens/second} at K=10, a 17\% improvement over llama.cpp on the same hardware. Reducing active experts to K=4 reaches \textbf{1.80 tokens/second} (+57\% vs llama.cpp). We systematically evaluate prediction-based prefetching (n-gram, MLP, FATE gate weights), and find that all approaches are bounded by the same PCIe Gen3 ceiling of 13~GB/s, explaining why caching dominates prediction for discrete GPU systems. Apple Silicon's 400~GB/s unified memory eliminates this ceiling entirely, achieving 4.4~tok/s on the same model as a reference point.
 \end{abstract}
 
 % ===================================================================
 \section{Introduction}
 % ===================================================================
 
-Large Mixture-of-Experts (MoE) models~\cite{shazeer2017outrageously,fedus2022switch} achieve strong performance while activating only a fraction of their parameters per token. Recent models like Qwen3.5-397B-A17B~\cite{qwen3.5} contain hundreds of billions of parameters across thousands of experts, with only 8--10 experts activated per token per layer. This sparsity enables on-device inference through SSD streaming---loading only the needed experts from storage on demand.
+Large Mixture-of-Experts (MoE) models~\cite{shazeer2017outrageously,fedus2022switch} achieve competitive performance while activating only a small fraction of their parameters per token. Qwen3.5-397B-A17B~\cite{qwen3.5} contains 397 billion total parameters across 512 experts per layer, with only 10 experts (K=10) activated per token. This sparsity enables on-device inference through SSD streaming, but creates a severe I/O problem: each token requires loading up to 600 expert weight tensors ($K \times 60$ layers).
 
-Prior work demonstrated SSD streaming on Apple Silicon, achieving 4.36 tokens/second for a 397B-parameter model on a MacBook Pro with 48GB RAM, streaming 209GB of 4-bit expert weights from a 17.5~GB/s NVMe SSD. However, this result relies on Apple's uniquely fast SSD and unified memory architecture.
+The model's total expert weights are 120GB at 2-bit quantization (3.38MB per expert), far exceeding the 24GB combined VRAM of two consumer RTX 3060 GPUs. Prior work on Apple Silicon (48GB unified RAM, 17.5~GB/s SSD) streams directly from SSD. Consumer desktop hardware reverses these constraints: slower SSD ($\sim$3.5~GB/s) but more RAM (96GB), creating a different optimization landscape.
 
-\textbf{Can consumer desktop hardware match or exceed this performance?} Desktop PCs typically have much slower SSDs (3--5~GB/s) but significantly more RAM (64--256GB). We show that this RAM advantage, combined with intelligent caching, more than compensates for the SSD disadvantage.
+\textbf{Key question}: Can a 3-tier cache hierarchy (GPU VRAM + CPU RAM + SSD) overcome the slower SSD and PCIe bandwidth bottleneck of discrete GPU systems?
 
-Our key contributions:
+Our contributions:
 \begin{enumerate}
-    \item \textbf{Frequency-aware expert caching}: We demonstrate that MoE expert activation follows a non-uniform distribution (Gini 0.23--0.47), and that caching the top 50\% most frequent experts in RAM achieves 69--84\% hit rates, effectively eliminating most SSD I/O.
-    \item \textbf{GPU-dedicated prediction pipeline}: Using a separate GPU for expert routing prediction (72$\mu$s per layer), we prefetch non-cached experts with minimal compute overhead.
-    \item \textbf{Dual-mode inference}: Our system supports both 4-bit quantized (fast) and bf16 lossless modes from the same codebase, with runtime selection.
-    \item \textbf{SVD negative result}: We provide the first systematic analysis showing that MoE expert weights are nearly full-rank (rank-64 energy ratio $= 0.47$), ruling out low-rank decomposition as a viable optimization strategy.
+    \item \textbf{3-tier expert cache}: GPU VRAM (6.8GB, 1980 experts, 57\% hit) + CPU pinned RAM (30GB, 9216 experts, 43\% hit) + SSD (0.1\% miss). Combined 99.9\% cache hit rate.
+    \item \textbf{Float8 non-expert quantization}: Reduces non-expert weight VRAM from 19.6GB to 12.0GB (freed 7.64GB), enabling a larger GPU expert cache.
+    \item \textbf{K=4 speed mode}: Reducing active experts from 10 to 4 reduces expert loads from 600 to 240 per token, achieving 1.80~tok/s (+57\% vs llama.cpp).
+    \item \textbf{Prediction ceiling analysis}: All prefetch approaches (n-gram, MLP, FATE gate prediction) hit the PCIe Gen3 ceiling (13~GB/s CPU$\to$GPU), confirming that caching capacity---not prediction accuracy---is the binding constraint on discrete GPU systems.
 \end{enumerate}
 
 % ===================================================================
@@ -45,247 +45,204 @@ Our key contributions:
 
 \subsection{Expert Offloading and Prefetching}
 
-Expert offloading addresses VRAM constraints by storing expert weights in CPU memory or SSD~\cite{xue2024moeinfinity}. Several systems implement prediction-based prefetching: FATE~\cite{fate2025} achieves 97\% prediction accuracy using cross-layer gate similarity, while Pre-Attention Expert Prediction~\cite{preattn2025} reaches 93--97\% accuracy with lightweight pre-attention routers. PreScope~\cite{prescope2025} combines learnable predictors with asynchronous I/O scheduling for 141\% throughput improvement.
+Expert offloading stores expert weights in CPU memory or SSD to overcome VRAM constraints~\cite{xue2024moeinfinity}. Several systems use prediction-based prefetching: FATE~\cite{fate2025} achieves 97\% prediction accuracy using cross-layer gate similarity ($W^{gate}_{l+1} \cdot h_l$). PreScope~\cite{prescope2025} combines learnable predictors with asynchronous I/O for 141\% throughput improvement. Our work shows that prediction accuracy improvements are negated by PCIe bandwidth contention on discrete GPU systems---a fundamental architectural constraint absent in unified memory systems.
 
 \subsection{CPU/GPU Hybrid Inference}
 
-KTransformers~\cite{ktransformers2025} pioneered CPU/GPU hybrid MoE inference with AMX-optimized kernels, achieving 4.6--19.7$\times$ prefill speedup. Our work differs by using the GPU primarily for expert forward passes while dedicating a separate GPU exclusively to prediction.
+KTransformers~\cite{ktransformers2025} uses CPU/GPU hybrid MoE inference with AMX-optimized kernels. llama.cpp supports partial GPU offloading. Both serve as baselines; our 3-tier cache outperforms llama.cpp by 17\% on the same hardware.
 
-\subsection{SSD-Based Inference}
+\subsection{SSD-Based Inference on Apple Silicon}
 
-SSD-based expert streaming on Apple Silicon achieves 4.36 tok/s. Our approach complements this by showing that large RAM caches can reduce SSD dependence to near-zero.
-
-% ===================================================================
-\section{Analysis: Why SVD Decomposition Fails}
-\label{sec:svd}
-% ===================================================================
-
-A natural approach to reducing expert I/O is decomposing each expert into a small ``base'' (low-rank approximation) that loads quickly, plus a larger ``residual'' loaded later. We systematically evaluate this on real Qwen3.5-35B-A3B expert weights.
-
-\subsection{SVD Energy Analysis}
-
-For each expert projection matrix $W \in \mathbb{R}^{m \times n}$, we compute $W = U\Sigma V^T$ and measure the fraction of total energy captured by the top-$r$ singular values:
-\begin{equation}
-    E(r) = \frac{\sum_{i=1}^{r} \sigma_i^2}{\sum_{i=1}^{\min(m,n)} \sigma_i^2}
-\end{equation}
-
-Table~\ref{tab:svd} shows results across 10 randomly sampled experts from Layer 0.
-
-\begin{table}[t]
-\centering
-\caption{SVD energy ratio of real MoE expert weights. Expert weights are nearly full-rank---rank-64 captures less than half the energy.}
-\label{tab:svd}
-\begin{tabular}{lcccc}
-\toprule
-Projection & Shape & Rank-64 & Rank-128 & Rank-256 \\
-\midrule
-gate\_proj & [512, 2048] & 0.477 & 0.732 & 0.965 \\
-up\_proj   & [512, 2048] & 0.467 & 0.727 & 0.964 \\
-down\_proj & [2048, 512] & 0.452 & 0.712 & 0.962 \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-The singular value spectrum decays slowly ($\sigma_0 / \sigma_{63} = 6.1\times$), indicating that expert weights distribute information broadly across dimensions rather than concentrating in a few dominant directions. A rank-64 base would capture only 47\% of the energy and achieve cosine similarity of just 0.68 with the full output---far below the $>$0.95 threshold needed for acceptable quality.
-
-\textbf{Conclusion}: SVD-based hierarchical loading is not viable for MoE experts. This motivates our caching-first approach.
+Apple Silicon's unified memory (400~GB/s) and fast NVMe (17.5~GB/s) enable SSD streaming at 4.4~tok/s for 397B. Discrete GPU + PCIe Gen3 ($\sim$13~GB/s H2D) creates a fundamentally different performance ceiling.
 
 % ===================================================================
-\section{Method: Frequency-Aware Expert Caching}
+\section{System Design}
 \label{sec:method}
 % ===================================================================
 
-\subsection{System Architecture}
+\subsection{Hardware and Model}
 
-Our system uses two GPUs on a consumer desktop:
+\textbf{Hardware}: 2$\times$ NVIDIA RTX 3060 (12GB each, 24GB total VRAM), 96GB DDR4 RAM, consumer NVMe SSD ($\sim$3.5~GB/s), PCIe Gen3 x16 ($\sim$13~GB/s H2D).
+
+\textbf{Model}: Qwen3.5-397B-A17B --- 60 transformer layers (45 GatedDeltaNet linear attention + 15 full attention), 512 experts per layer, $K=10$ active experts per token, hidden dimension 4096. Expert weights: 120GB total at 2-bit (3.38MB per expert, repacked from 4-bit GPTQ).
+
+\subsection{Layer Split}
+
+Non-expert weights (attention projections, norms, embeddings) are distributed across both GPUs:
 \begin{itemize}
-    \item \textbf{GPU 0 (Prediction)}: Stores all gate routing weights (84~MB for 40 layers) and predicts expert activation for upcoming layers.
-    \item \textbf{GPU 1 (Compute)}: Executes attention projections and expert forward passes.
-    \item \textbf{CPU}: Handles linear attention (OpenBLAS), routing decisions, and I/O coordination.
-    \item \textbf{RAM} (125~GB): Hosts the frequency-aware expert cache.
+    \item GPU 0: layers 0--23 (24 layers)
+    \item GPU 1: layers 24--59 (36 layers)
 \end{itemize}
 
-\subsection{Expert Activation Profiling}
+Before float8 quantization, non-expert weights require 19.6GB VRAM across both GPUs, leaving only 4.4GB for expert cache. Float8 quantization of attention/projection weights reduces this to 12.0GB, freeing 7.64GB for expert cache.
 
-We observe that expert activation is highly non-uniform. Profiling Qwen3.5-35B-A3B with 5,000 random hidden states per layer reveals:
+\subsection{3-Tier Expert Cache}
 
-\begin{table}[t]
+\begin{figure}[t]
 \centering
-\caption{Expert activation distribution across 40 layers. Activation is significantly non-uniform, with Gini coefficients ranging from 0.23 to 0.47.}
-\label{tab:activation}
-\begin{tabular}{lccc}
-\toprule
-Metric & Mean & Min & Max \\
-\midrule
-HOT count (50\% coverage) & 61.5 & 46 & 88 \\
-COLD count ($<$1\% freq) & 37.0 & 6 & 74 \\
-Gini coefficient & 0.385 & 0.231 & 0.466 \\
-Top-20\% coverage & 43.2\% & 32.5\% & 53.2\% \\
-\bottomrule
-\end{tabular}
-\end{table}
+\begin{verbatim}
+Token → routing → K experts needed
+         │
+         ├─ GPU VRAM  (6.8GB,  ~1980 experts) 57% hit
+         ├─ CPU RAM   (30GB,   ~9216 experts) 43% hit
+         └─ SSD       (120GB,  rest)          0.1% miss
+\end{verbatim}
+\caption{3-tier expert cache hierarchy. Total hit rate: 99.9\%.}
+\label{fig:cache}
+\end{figure}
 
-Based on this profiling, we classify experts into three tiers:
-\begin{itemize}
-    \item \textbf{HOT} (top 50\%): Cached permanently in RAM. Covers 69--84\% of activations.
-    \item \textbf{WARM} (middle 30\%): Stored on SSD, loaded via prediction-triggered prefetch.
-    \item \textbf{COLD} (bottom 20\%): Stored on SSD, loaded on demand.
-\end{itemize}
+\textbf{Cache population}: An initial COLD pass through the prompt builds an expert frequency map. Hot experts (most frequently activated) fill GPU VRAM first, then CPU pinned RAM. Subsequent inference passes serve expert weights from VRAM (instant) or CPU RAM (H2D transfer, $\sim$0.26ms) with only true misses touching SSD ($\sim$1.3ms).
 
-\subsection{GPU-Dedicated Prediction}
+\textbf{CPU pinned memory}: Expert tensors are allocated with \texttt{pin\_memory=True}, enabling asynchronous H2D transfers via DMA without CPU involvement.
 
-GPU 0 runs gate projections for upcoming layers to predict which experts will be needed:
+\subsection{Fused CUDA Kernel}
 
-\begin{equation}
-    \hat{e}_{l+1} = \text{TopK}(\text{softmax}(W^{gate}_{l+1} \cdot h_l), K)
-\end{equation}
+Expert forward passes use a custom CUDA kernel (\texttt{expert\_ops.cu}) that fuses 2-bit dequantization + batched GEMV + SiLU activation in a single launch. This replaces 10 serial expert calls per layer with one batched launch, reducing kernel launch overhead.
 
-where $W^{gate}_{l+1}$ is the gate weight for layer $l+1$ and $h_l$ is the current hidden state. This prediction runs in parallel with GPU 1's computation on the current layer.
+\subsection{Thread Pool I/O}
 
-\textbf{Prediction overhead}: 72$\mu$s mean per layer (P50: 62$\mu$s), with all 40 layers predicted in 1.15~ms total---less than 4\% of per-layer inference time.
-
-\subsection{Inference Pipeline}
-
-For each layer $l$ in the forward pass:
-\begin{enumerate}
-    \item GPU 0 predicts layer $l+1$ experts (parallel with step 2--4)
-    \item GPU 1 computes attention projections
-    \item CPU performs routing: softmax + top-K selection
-    \item For each selected expert $e_k$:
-    \begin{itemize}
-        \item If $e_k \in$ HOT cache: load from RAM ($\sim$0~ms)
-        \item If $e_k$ was prefetched: load from page cache ($\sim$0~ms)
-        \item Otherwise: load from SSD via mmap ($\sim$1~ms)
-    \end{itemize}
-    \item GPU 1 executes expert forward passes
-    \item Combine expert outputs + residual connection
-\end{enumerate}
+SSD expert reads use a 16-worker thread pool, issuing all expert reads for a layer in parallel. This overlaps per-expert I/O latency across the $K$ experts required per layer.
 
 % ===================================================================
 \section{Experiments}
 \label{sec:experiments}
 % ===================================================================
 
-\subsection{Setup}
-
-\textbf{Hardware}: AMD Ryzen 7 5800X (8-core), 2$\times$ NVIDIA RTX 3060 (12GB), 125GB DDR4 RAM, consumer NVMe SSD ($\sim$3.5~GB/s).
-
-\textbf{Baseline}: MacBook Pro M3 Max (48GB unified RAM, 17.5~GB/s Apple SSD, 40-core Metal GPU), measured at 4.36 tok/s on the same model.
-
-\textbf{Model}: Qwen3.5-35B-A3B (40 layers, 256 experts, $K=8$, hidden=2048).
-
 \subsection{Main Results}
 
 \begin{table}[t]
 \centering
-\caption{Throughput comparison. Our system with 50\% HOT cache achieves 5.55 tok/s in bf16 lossless mode, 27\% faster than Flash-MoE on Mac M3 Max.}
+\caption{Throughput on Qwen3.5-397B-A17B, dual RTX 3060.}
 \label{tab:main}
-\begin{tabular}{lccc}
-\toprule
-System & Mode & Cache Hit & tok/s \\
-\midrule
-Mac M3 Max (Flash-MoE) & 4-bit & 17\% (page) & 4.36 \\
-\midrule
-PC, no cache & bf16 & 0\% & 2.15 \\
-PC, HOT 20\% & bf16 & 34\% & 3.10 \\
-PC, HOT 30\% & bf16 & 47\% & 3.68 \\
-\textbf{PC, HOT 50\%} & \textbf{bf16} & \textbf{69\%} & \textbf{5.55} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Cache Hit Rate Analysis}
-
-\begin{table}[t]
-\centering
-\caption{Cache hit rate by layer for different HOT cache sizes. Deeper layers show higher hit rates due to more concentrated activation patterns.}
-\label{tab:hitrate}
-\begin{tabular}{lccccc}
-\toprule
-HOT \% & L0 & L10 & L20 & L30 & L39 \\
-\midrule
-20\% & 34\% & 43\% & 55\% & 42\% & 46\% \\
-30\% & 45\% & 60\% & 65\% & 58\% & 61\% \\
-50\% & 69\% & 81\% & 81\% & 76\% & 84\% \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Combined Coverage: HOT Cache + Prediction}
-
-Table~\ref{tab:combined} shows the combined effectiveness of HOT caching and cross-layer prediction across all 39 layer pairs.
-
-\begin{table}[t]
-\centering
-\caption{Combined HOT 50\% cache + Fate-style top-16 prediction coverage across all 39 layer pairs (N=500).}
-\label{tab:combined}
-\begin{tabular}{lccc}
-\toprule
-Strategy & HOT Hit & Pred Hit & Miss \\
-\midrule
-No cache, no prediction & --- & --- & 100\% \\
-HOT 50\% only & 77.0\% & --- & 23.0\% \\
-Prediction only & --- & 25.1\% & 74.9\% \\
-\textbf{HOT 50\% + Prediction} & \textbf{77.0\%} & \textbf{2.4\%} & \textbf{20.6\%} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\textbf{Key finding}: The HOT cache dominates coverage (77\%), while cross-layer prediction adds only 2.4\%. This indicates that \textit{frequency-aware caching is the primary contributor}, not prediction---a departure from the prevailing research focus on prediction accuracy.
-
-\subsection{GPU Prediction Overhead}
-
-\begin{table}[t]
-\centering
-\caption{GPU prediction latency with real gate weights on GPU 0.}
-\label{tab:prediction}
-\begin{tabular}{lc}
-\toprule
-Metric & Value \\
-\midrule
-Single layer prediction (P50) & 62~$\mu$s \\
-All 40 layers (total) & 1.15~ms \\
-VRAM usage (40 layers) & 84~MB (0.7\%) \\
-Overhead vs.\ layer time & $<$4\% \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Why This Works: RAM vs.\ SSD Trade-off}
-
-\begin{table}[t]
-\centering
-\caption{Hardware comparison: Mac M3 Max vs.\ consumer desktop.}
-\label{tab:hardware}
 \begin{tabular}{lcc}
 \toprule
-Resource & Mac M3 Max & Desktop PC \\
+Configuration & tok/s & vs llama.cpp \\
 \midrule
-GPU bandwidth & 400 GB/s & 384 GB/s \\
-SSD bandwidth & \textbf{17.5 GB/s} & 3.5 GB/s \\
-RAM & 48 GB & \textbf{125 GB} \\
-Expert cache capacity & $\sim$17\% & $\sim$52\% \\
+llama.cpp (Q4\_K\_M, 3 GPU layers) & 1.15 & baseline \\
+SSD only, no cache (K=10) & 0.77 & -33\% \\
+GPU VRAM cache only (K=10) & 1.09 & -5\% \\
+\textbf{3-tier cache (K=10)} & \textbf{1.35} & \textbf{+17\%} \\
+\textbf{3-tier cache (K=4)} & \textbf{1.80} & \textbf{+57\%} \\
+\midrule
+\textit{Mac M3 Max (reference)} & \textit{4.4} & \textit{n/a} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The Mac's 5$\times$ faster SSD is offset by the PC's 2.6$\times$ larger RAM. Since expert access follows a non-uniform distribution, caching the frequently-accessed experts in RAM eliminates the majority of SSD accesses, making the SSD speed difference largely irrelevant.
+The 3-tier cache at K=10 achieves 1.35~tok/s, 17\% faster than llama.cpp. Reducing K from 10 to 4 cuts expert loads per token from 600 to 240 (60\% reduction), reaching 1.80~tok/s. Apple Silicon's reference result (4.4~tok/s) reflects the unified memory architecture advantage, not a software difference.
+
+\subsection{Float8 VRAM Analysis}
+
+\begin{table}[t]
+\centering
+\caption{VRAM usage before and after float8 non-expert quantization.}
+\label{tab:float8}
+\begin{tabular}{lcc}
+\toprule
+& Before float8 & After float8 \\
+\midrule
+GPU 0 VRAM & 10.28 GB & 7.23 GB \\
+GPU 1 VRAM & 9.32 GB & 4.74 GB \\
+Total non-expert & 19.60 GB & 11.97 GB \\
+Freed for expert cache & --- & 7.64 GB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Float8 non-expert quantization has negligible quality impact for attention/projection weights and frees 7.64GB of VRAM, which is reallocated to the GPU expert cache.
+
+\subsection{Cache Hit Rate}
+
+With 6.8GB GPU VRAM cache ($\sim$1980 experts) and 30GB CPU pinned cache ($\sim$9216 experts), the activation trace from the COLD pass achieves:
+
+\begin{table}[t]
+\centering
+\caption{Cache hit rates for 3-tier system (K=10, 50-token generation).}
+\label{tab:hitrate}
+\begin{tabular}{lccc}
+\toprule
+Tier & Size & Hit Rate & Latency \\
+\midrule
+GPU VRAM & 6.8 GB & 57\% & $\sim$0 ms \\
+CPU pinned RAM & 30 GB & 43\% & $\sim$0.26 ms \\
+SSD & 120 GB & 0.1\% & $\sim$1.3 ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Prediction Experiments: The PCIe Ceiling}
+\label{sec:prediction}
+
+We systematically evaluated prediction-based prefetching to reduce SSD misses and CPU$\to$GPU H2D stalls:
+
+\begin{table}[t]
+\centering
+\caption{Prediction-based prefetch experiments (all K=4).}
+\label{tab:prediction}
+\begin{tabular}{lccc}
+\toprule
+Method & GPU Hit Rate & FULL+GPU & vs baseline \\
+\midrule
+K=4 baseline & 59.9\% & 1.800 & --- \\
+N-gram (per-expert top-4) & --- & 1.062 & -41\% \\
+N-gram (global top-10) & --- & 1.323 & -26\% \\
+MLP (1,740 samples) & 29.8\%\textsuperscript{*} & --- & n/a \\
+MLP (34,800 samples) & 25.7\%\textsuperscript{*} & --- & n/a \\
+FATE gate predict & 76.6\% & 1.712 & -5\% \\
+FATE + shallow cache & 43.7\% & 1.497 & -17\% \\
+\bottomrule
+\end{tabular}
+\vspace{1mm}
+
+\textsuperscript{*}hit@10 rate on validation set; not integrated into inference loop due to poor accuracy.
+\end{table}
+
+\textbf{N-gram prefetch}: A per-expert co-activation table (82.8\% in-distribution accuracy) issued $\sim$700 H2D transfers per token vs 310 actually needed. PCIe congestion from over-prediction caused a 41\% slowdown.
+
+\textbf{MLP predictor}: A 3-layer MLP trained on $h_{\text{normed}}[L]$ to predict expert activations at layer $L+1$ achieved 29.8\% hit@10 on 1,740 training samples, degrading to 25.7\% with 20$\times$ more data. Cross-layer prediction is fundamentally difficult: the attention + expert compute + residual + normalization between layers makes $h[L]$ a weak predictor of $L+1$ routing.
+
+\textbf{FATE gate prediction}: Implementing the gate-weight prediction from FATE~\cite{fate2025} ($\hat{e}_{l+1} = \text{TopK}(W^{gate}_{l+1} \cdot h_l)$) improved GPU hit rate from 59.9\% to 76.6\% (prediction is working), but throughput dropped from 1.800 to 1.712~tok/s. Accurate prefetch H2D transfers compete with cpu\_hit$\to$GPU transfers over the same PCIe bus.
+
+\textbf{Root cause}: PCIe Gen3 H2D bandwidth ($\sim$13~GB/s) is the binding constraint. Adding prefetch traffic to the bus---even perfectly accurate prefetch---adds H2D load that cancels the gain from higher GPU hit rates. All prediction approaches, regardless of accuracy, hit this ceiling.
+
+\subsection{K=4 Tradeoff}
+
+\begin{table}[t]
+\centering
+\caption{K=4 vs K=10 across cache configurations.}
+\label{tab:topk}
+\begin{tabular}{lcc}
+\toprule
+Cache Configuration & K=10 & K=4 \\
+\midrule
+COLD (no cache) & 0.77 & 1.118 \\
+GPU VRAM only & 1.09 & 1.536 \\
+Full 3-tier & 1.35 & \textbf{1.800} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+K=4 reduces expert loads per token from $K \times 60 = 600$ to 240 (60\% reduction). Since PCIe bandwidth is the bottleneck, load reduction translates nearly linearly to throughput gain. K=4 matches the active expert count used by the Mac Metal implementation for speed.
+
+\textbf{Trade-off}: Skipping 6 of 10 experts per token reduces output quality. Generation remains coherent for general use but is not recommended for tasks requiring model accuracy (long-form reasoning, code generation).
 
 % ===================================================================
 \section{Discussion}
 % ===================================================================
 
-\textbf{Scaling to 397B}: For Qwen3.5-397B-A17B (60 layers, 512 experts), the model requires 120GB at 2-bit quantization, exceeding the hot cache capacity of our 96GB RAM test system. In practice, a 3-tier cache (GPU VRAM 6.8GB + CPU RAM 30GB + SSD) achieves 1.35 tok/s with 57\%/43\%/0.1\% hit rates per tier---well below the 35B result due to the tighter memory budget and PCIe bandwidth ceiling of 13 GB/s.
+\textbf{PCIe as destiny}: For discrete GPU + CPU systems, PCIe Gen3 H2D bandwidth is the fundamental bottleneck. Expert weight data ($K$ experts $\times$ 60 layers $\times$ 3.38MB = up to 2.028GB per token at cold) must traverse PCIe for every token. No software optimization---prediction, prefetch, compression, compilation---can overcome this for large-K inference without increasing RAM-resident cache size.
 
-\textbf{Prediction vs.\ Caching}: Our results challenge the prevailing focus on prediction accuracy in MoE inference optimization. The HOT cache provides 77\% coverage with zero prediction error, while even perfect prediction only reduces the remaining 23\% miss rate. This suggests that \textit{investing in more RAM may be more effective than investing in better predictors}.
+\textbf{Caching $\gg$ Prediction}: Our experiments consistently show that increasing cache capacity (more GPU VRAM, more pinned RAM) outperforms improving prediction accuracy. The fundamental reason: cache hits are free; prediction hits still require PCIe transfers. Only VRAM-resident data is truly zero-cost.
 
-\textbf{Lossless Inference}: Unlike 4-bit quantization approaches, our bf16 mode produces bit-identical results to the reference implementation, with no quality degradation. This is particularly important for applications requiring exact reproducibility.
+\textbf{Unified memory advantage}: Apple Silicon's 400~GB/s unified memory and 17.5~GB/s NVMe bypass the PCIe ceiling entirely. Expert weights move between storage and GPU at memory bandwidth, not PCIe bandwidth. This architectural difference explains why the Mac reference (4.4~tok/s) is 3.3$\times$ faster despite similar GPU compute: the bottleneck is different in kind, not just degree.
+
+\textbf{Practical recommendation}: For 397B MoE inference on consumer hardware, the optimal configuration is 3-tier caching with K=4 for throughput (1.80~tok/s) or K=10 for quality (1.35~tok/s). Prediction-based approaches should be avoided---they add complexity without improving throughput due to PCIe contention.
 
 % ===================================================================
 \section{Conclusion}
 % ===================================================================
 
-We presented Frequency-Aware Expert Caching (FAEC), demonstrating that consumer desktop hardware with large RAM can outperform Apple Silicon for MoE inference. By exploiting the non-uniform expert activation distribution, our system achieves 5.55 tok/s on Qwen3.5-35B-A3B in bf16 lossless mode---27\% faster than Flash-MoE on a MacBook Pro M3 Max. Our negative result on SVD decomposition provides a useful reference for the community, and our finding that caching dominates prediction challenges the current research direction.
+We presented a 3-tier expert caching system for running Qwen3.5-397B-A17B on dual consumer RTX 3060 GPUs. The system achieves 1.35~tok/s at K=10 (+17\% vs llama.cpp) and 1.80~tok/s at K=4 (+57\% vs llama.cpp) through frequency-aware caching across GPU VRAM, CPU pinned RAM, and SSD. We find that prediction-based prefetching---despite achieving 76.6\% GPU hit rates via FATE gate prediction---provides no throughput benefit due to PCIe bandwidth contention, establishing PCIe Gen3 as the fundamental ceiling for discrete GPU MoE inference. Apple Silicon's unified memory architecture eliminates this ceiling, representing an architectural advantage that software optimizations cannot fully overcome.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}
