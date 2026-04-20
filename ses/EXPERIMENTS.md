@@ -42,6 +42,20 @@ SSD expert reads issued in parallel via thread pool.
 First pass through model builds expert frequency map → identifies HOT experts to cache.  
 **Result**: Enables frequency-aware cache population without manual tuning.
 
+### K=4 Active Experts (vs model default K=10)
+Inspired by the Mac Metal implementation which uses K=4 for speed despite model spec of K=10.  
+Added `--top-k 4` CLI override; model config patched before instantiation.  
+**Result: 1.800 tok/s (+33% vs K=10 baseline of 1.35 tok/s).**
+
+| Pass | K=10 | K=4 |
+|---|---|---|
+| COLD (no cache) | 0.77 | 1.118 |
+| GPU cache only | 1.09 | 1.536 |
+| Full 3-tier | 1.35 | **1.800** |
+
+**Why it works**: Expert loads per token = K × 60 layers. K=4 → 240 loads vs K=10 → 600 loads (60% reduction). PCIe is the bottleneck, so fewer loads = proportionally faster.  
+**Trade-off**: 6 out of 10 experts skipped per token. Output quality is reduced but still coherent for general use.
+
 ---
 
 ## What Failed

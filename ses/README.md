@@ -17,9 +17,10 @@ Running **Qwen3.5-397B-A17B** (397 billion parameters) on two consumer GPUs at *
 | Configuration | tok/s | Notes |
 |---|---|---|
 | llama.cpp (Q4_K_M, 3 GPU layers) | 1.15 | Baseline |
-| SSD only (cold, no cache) | 0.77 | Every expert loaded from SSD |
-| GPU VRAM cache only | 1.09 | 6.8GB, ~1980 experts |
-| **3-tier cache (this work)** | **1.35** | **+17% vs llama.cpp** |
+| SSD only (cold) | 0.77 | K=10, no cache |
+| GPU cache only | 1.09 | K=10, 6.8GB VRAM cache |
+| **3-tier cache, K=10** | **1.35** | **+17% vs llama.cpp** |
+| **3-tier cache, K=4** | **1.80** | **+57% vs llama.cpp (quality trade-off)** |
 
 ## How It Works
 

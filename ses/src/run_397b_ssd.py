@@ -719,6 +719,8 @@ def main():
                         help='Tokens per prompt during hs collection (default: same as --tokens)')
     parser.add_argument('--predictor', default=None,
                         help='Path to trained CrossLayerExpertPredictor .pt file')
+    parser.add_argument('--top-k', type=int, default=None,
+                        help='Override active experts per token (default: from model config, K=10)')
     args = parser.parse_args()
 
     from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -727,6 +729,8 @@ def main():
     config = AutoConfig.from_pretrained(MODEL_DIR, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
     tc = config.text_config
+    if args.top_k is not None:
+        tc.num_experts_per_tok = args.top_k
     n_layers = args.max_layers or tc.num_hidden_layers
     print(f"  Model: {tc.num_hidden_layers} layers, {tc.num_experts} experts, "
           f"K={tc.num_experts_per_tok}, hidden={tc.hidden_size}")
