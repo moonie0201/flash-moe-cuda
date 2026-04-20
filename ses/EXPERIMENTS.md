@@ -104,7 +104,7 @@ At layer 23→24 boundary, prefetch used layer L's device (cuda:0) for layer L+1
 - No amount of prediction accuracy overcomes 13 GB/s if you have to move data
 
 Apple Silicon's 400 GB/s unified memory eliminates this wall entirely:
-- Mac M3 Max (48GB, unified): **4.4 tok/s** on 397B
+- Mac M3 Max (48GB, unified): **4.4 tok/s** on 397B (reference, not measured by this project)
 - Dual RTX 3060 (24GB VRAM + 96GB DDR4, PCIe): **1.35 tok/s** on 397B
 
 **Conclusion**: For large MoE on consumer hardware, unified memory architecture (Apple Silicon) dominates discrete GPU+PCIe regardless of software optimization depth.

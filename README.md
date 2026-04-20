@@ -37,7 +37,7 @@ Token → routing → which 10 experts needed?
 
 ### Key Optimizations
 
-- **2-bit expert quantization** — 120GB total (vs 480GB at BF16); 3.38MB per expert
+- **2-bit quantized expert weights** — 120GB total (vs 480GB at BF16); 3.38MB per expert (repacked from 4-bit)
 - **Float8 non-expert weights** — freed 7.64GB VRAM (19.6GB → 12.0GB)
 - **Layer-split across GPUs** — layers 0–23 on GPU0, 24–59 on GPU1
 - **Fused CUDA kernel** — 2-bit dequant + batched GEMV + SiLU in one launch
@@ -48,7 +48,7 @@ Token → routing → which 10 experts needed?
 
 PCIe Gen3 = 13 GB/s CPU→GPU. Every optimization runs into this wall eventually. Prediction, prefetch, compression — all tested, all hit the same ceiling. See [ses/EXPERIMENTS.md](ses/EXPERIMENTS.md) for the full log.
 
-Apple Silicon (400 GB/s unified memory) eliminates this wall entirely — that's why Mac gets 4.4 tok/s on the same model.
+Apple Silicon (400 GB/s unified memory) eliminates this wall entirely — reference implementations on Mac M3 Max report 4.4 tok/s on the same model.
 
 ## Quick Start
 
