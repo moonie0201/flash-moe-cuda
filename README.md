@@ -23,7 +23,7 @@ Running **Qwen3.5-397B-A17B** (397 billion parameters) on a dual RTX 3060 deskto
 
 ## How It Works
 
-The 397B model has 60 layers × 512 experts per layer. Each token activates only 10 experts — but that's still 600 expert loads per token from a 120GB file on SSD.
+The 397B model has 60 layers (45 linear attention + 15 full attention) × 512 experts per layer. Each token activates only 10 experts — but that's still 600 expert loads per token from a 120GB file on SSD.
 
 ### 3-Tier Expert Cache
 
