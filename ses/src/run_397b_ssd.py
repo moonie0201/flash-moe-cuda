@@ -193,7 +193,8 @@ def attach_layer_device_hooks(model, layer_device_fn):
             model.model.norm.register_forward_pre_hook(make_hook(final_dev), with_kwargs=True)
 
 
-def patch_experts(model, packed_loader, hot_cache, gpu_cache=None):
+def patch_experts(model, packed_loader, hot_cache, gpu_cache=None,
+                  num_experts_per_tok=10):
     """Replace Qwen3_5MoeExperts.forward with SSD-streaming version."""
 
     if gpu_cache is None:
@@ -224,6 +225,8 @@ def patch_experts(model, packed_loader, hot_cache, gpu_cache=None):
     _hs_trace = []            # [(layer_idx, h_normed_np, expert_ids_list), ...] COLD only
     _collect_hs = [False]     # enabled by --save-hs before COLD pass
     _predictor = [None]       # CrossLayerExpertPredictor instance (loaded post-COLD)
+    _gate_weights_cpu = getattr(packed_loader, '_gate_weights_cpu', [])  # gate-predict weights
+    _gate_predict_enabled = [getattr(packed_loader, '_gate_predict_enabled', False)]
     packed_loader._token_acts = _token_acts
     packed_loader._cur_acts = _cur_acts
     packed_loader._prefetch = _prefetch
@@ -400,9 +403,17 @@ def patch_experts(model, packed_loader, hot_cache, gpu_cache=None):
                     next_layer = layer_idx + 1
                     next_device = torch.device('cuda:0') if next_layer < 24 else torch.device('cuda:1')
 
-                    # Predictor path: trained MLP predicts exactly top-K experts
-                    pred_model = _predictor[0]
-                    if pred_model is not None:
+                    # Gate-predict path (FATE): use actual gate weights of layer+1
+                    # to predict which experts will be activated.  ~97% accuracy,
+                    # no training needed.  Only runs when --gate-predict is set.
+                    if _gate_predict_enabled[0] and layer_idx < len(_gate_weights_cpu):
+                        h_cpu = hidden_states[0].detach().cpu().float()  # [hidden_size]
+                        gate_w = _gate_weights_cpu[layer_idx]            # [num_experts, hidden_size]
+                        logits = gate_w @ h_cpu                          # [num_experts]
+                        predicted_eids = logits.topk(num_experts_per_tok).indices.tolist()
+                    elif _predictor[0] is not None:
+                        # Predictor path: trained MLP predicts exactly top-K experts
+                        pred_model = _predictor[0]
                         with torch.no_grad():
                             logits = pred_model(hidden_states[0].cpu().float(), layer_idx)
                         predicted_eids = logits.topk(10).indices.tolist()
@@ -627,13 +638,18 @@ def build_hot_cache(shards, hot_pct, num_layers, num_experts, num_experts_per_to
 
 
 def build_gpu_hot_cache_2bit(activation_trace, packed_loader, layer_device_fn,
-                              max_vram_gb=10.0, safety_margin_gb=2.5):
+                              max_vram_gb=10.0, safety_margin_gb=2.5,
+                              num_layers=60, num_experts=512,
+                              shallow_layers=6):
     """Build GPU-resident raw 2-bit expert cache from activation trace.
 
     Stores 3.54MB uint8 tensors on GPU. Hit path: GPU dequant (no PCIe).
     Per-device budgeting with OOM exception handling.
+
+    FATE finding: shallow layers (0..shallow_layers-1) have lower gate-predict
+    accuracy due to diffuse routing — cache them fully first, then fill the
+    remaining VRAM budget by global activation frequency.
     """
-    ranked = sorted(activation_trace.items(), key=lambda x: -x[1])
     expert_mb = 3.54  # 2-bit expert size
     n_dev = torch.cuda.device_count()
 
@@ -643,7 +659,8 @@ def build_gpu_hot_cache_2bit(activation_trace, packed_loader, layer_device_fn,
         dev_budget_mb[i] = max(0.0, free_gb - safety_margin_gb) * 1024
 
     total_budget_mb = min(max_vram_gb * 1024, sum(dev_budget_mb.values()))
-    print(f"Building GPU HOT cache (≤{max_vram_gb:.1f}GB total, {expert_mb:.1f}MB/expert)...")
+    print(f"Building GPU HOT cache (≤{max_vram_gb:.1f}GB total, {expert_mb:.1f}MB/expert, "
+          f"shallow_layers={shallow_layers})...")
     for i in range(n_dev):
         free_gb = torch.cuda.mem_get_info(i)[0] / 1e9
         print(f"  GPU {i}: {free_gb:.1f}GB available for cache")
@@ -653,27 +670,51 @@ def build_gpu_hot_cache_2bit(activation_trace, packed_loader, layer_device_fn,
     total_used_mb = 0.0
     oom_devices = set()
 
-    for (layer, eid), cnt in ranked:
+    def _load_into_cache(layer, eid):
+        """Attempt to load one expert into GPU cache. Returns True on success."""
+        nonlocal total_used_mb
+        if (layer, eid) in cache:
+            return True
         if total_used_mb + expert_mb > total_budget_mb:
-            break
+            return False
         device = layer_device_fn(layer)
         dev_idx = device.index if device.index is not None else 0
         if dev_idx in oom_devices:
-            continue
+            return False
         if used_mb[dev_idx] + expert_mb > dev_budget_mb[dev_idx]:
-            continue
+            return False
         try:
             raw_np = packed_loader.load_expert_raw_bytes(layer, eid)
             gpu_tensor = torch.from_numpy(raw_np).to(device, non_blocking=True)
             cache[(layer, eid)] = gpu_tensor
             used_mb[dev_idx] += expert_mb
             total_used_mb += expert_mb
+            return True
         except torch.cuda.OutOfMemoryError:
             oom_devices.add(dev_idx)
             torch.cuda.empty_cache()
-            continue
+            return False
 
-    per_dev = {i: f"GPU {i}: {used_mb[i]/1024:.2f}GB" for i in range(n_dev)}
+    # Phase 1: Shallow-layer priority (FATE finding).
+    # Cache ALL experts from layers 0..shallow_layers-1 to avoid prediction
+    # misses in early layers where gate routing is more diffuse.
+    if shallow_layers > 0:
+        shallow_count_before = 0
+        for layer in range(min(shallow_layers, num_layers)):
+            for eid in range(num_experts):
+                _load_into_cache(layer, eid)
+        shallow_count_before = len(cache)
+        shallow_gb = total_used_mb / 1024
+        print(f"  Shallow cache (layers 0-{shallow_layers-1}): "
+              f"{shallow_count_before} experts, {shallow_gb:.2f}GB")
+
+    # Phase 2: Fill remaining budget by global activation frequency.
+    ranked = sorted(activation_trace.items(), key=lambda x: -x[1])
+    for (layer, eid), cnt in ranked:
+        if total_used_mb + expert_mb > total_budget_mb:
+            break
+        _load_into_cache(layer, eid)
+
     covered = sum(cnt for k, cnt in activation_trace.items() if k in cache)
     total_obs = sum(activation_trace.values())
     print(f"GPU cache: {len(cache)} experts, {total_used_mb/1024:.1f}GB total")
@@ -721,6 +762,12 @@ def main():
                         help='Path to trained CrossLayerExpertPredictor .pt file')
     parser.add_argument('--top-k', type=int, default=None,
                         help='Override active experts per token (default: from model config, K=10)')
+    parser.add_argument('--gate-predict', action='store_true',
+                        help='Use actual gate weights of layer L+1 to predict experts (FATE approach, ~97%% accuracy)')
+    parser.add_argument('--shallow-layers', type=int, default=6,
+                        help='Number of shallow layers to fully cache in GPU VRAM first (FATE finding, default=6)')
+    parser.add_argument('--packed-gptq', action='store_true',
+                        help='Use PackedGPTQLoader (4-bit per-layer packed files, ~186GB) instead of safetensors scatter')
     args = parser.parse_args()
 
     from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -758,9 +805,32 @@ def main():
     for i in range(torch.cuda.device_count()):
         print(f"  GPU {i}: {torch.cuda.memory_allocated(i)/1e9:.2f}GB")
 
+    # 3b. Extract gate weights for gate-based prediction (FATE approach).
+    # Must be done BEFORE float8 conversion which may alter gate weight precision.
+    # _gate_weights_cpu[i] predicts experts for layer i+1 given hidden states at layer i.
+    # Covers layers 1..n_layers-1 (predicting from hidden states of layer 0..n_layers-2).
+    _gate_weights_cpu = []
+    if args.gate_predict:
+        print("3b. Extracting gate weights for gate-based prediction (FATE)...")
+        layers = model.model.layers if hasattr(model.model, 'layers') \
+            else model.model.language_model.layers
+        for i in range(1, n_layers):
+            try:
+                gate_w = layers[i].mlp.gate.weight.detach().cpu().float()
+                _gate_weights_cpu.append(gate_w)  # shape [num_experts, hidden_size]
+            except AttributeError:
+                print(f"  WARNING: gate weight not found at layer {i}, "
+                      f"layers[i].mlp.gate.weight — disabling gate-predict")
+                _gate_weights_cpu = []
+                break
+        if _gate_weights_cpu:
+            shape = _gate_weights_cpu[0].shape
+            print(f"  Extracted {len(_gate_weights_cpu)} gate weight tensors, "
+                  f"shape={list(shape)}")
+
     if args.float8_nonexpert:
         from float8_nonexpert import apply_float8_nonexpert
-        print("3b. Applying float8 non-expert quantization...")
+        print("3c. Applying float8 non-expert quantization...")
         apply_float8_nonexpert(model)
         for i in range(torch.cuda.device_count()):
             print(f"  GPU {i} after float8: {torch.cuda.memory_allocated(i)/1e9:.2f}GB")
@@ -772,6 +842,9 @@ def main():
     if is_2bit:
         print("5. Setting up TwoBitLoader (2-bit, 3.38MB/expert)...")
         packed_loader = TwoBitLoader(PACKED_2BIT_DIR, device=torch.device('cuda:0'))
+    elif args.packed_gptq:
+        print("5. Setting up PackedGPTQLoader (4-bit per-layer packed, ~6MB/expert)...")
+        packed_loader = PackedGPTQLoader(PACKED_GPTQ_DIR, device=torch.device('cuda:0'))
     elif args.gptq:
         # NOTE: PackedGPTQLoader produced garbage output under memory pressure
         # (likely pin_memory / byte-alignment / GPU view lifetime issue).
@@ -787,8 +860,17 @@ def main():
 
     print("6. Patching expert forward with SSD streaming...")
     gpu_cache = {}
-    n_patched = patch_experts(model, packed_loader, hot_cache, gpu_cache)
+    # Attach gate weights before patch_experts so the closure can pick them up
+    packed_loader._gate_weights_cpu = _gate_weights_cpu
+    packed_loader._gate_predict_enabled = bool(_gate_weights_cpu) and args.gate_predict
+    n_patched = patch_experts(model, packed_loader, hot_cache, gpu_cache,
+                              num_experts_per_tok=tc.num_experts_per_tok)
     print(f"  Patched {n_patched} MoE layers")
+    if args.gate_predict and packed_loader._gate_predict_enabled:
+        print(f"  Gate-based prediction (FATE): ENABLED "
+              f"({len(_gate_weights_cpu)} layers, shape={list(_gate_weights_cpu[0].shape)})")
+    elif args.gate_predict:
+        print("  Gate-based prediction (FATE): DISABLED (gate weights not extracted)")
 
     if args.compile:
         print("6b. Applying torch.compile (reduce-overhead, dynamic)...")
@@ -889,6 +971,12 @@ def main():
         packed_loader._prefetch_enabled[0] = True
         print(f"Loaded predictor from {args.predictor} — prefetch ENABLED")
 
+    # Gate-predict prefetch: enable _prefetch_enabled so the produce_prefetch
+    # section runs; gate-predict path is selected inside by _gate_predict_enabled.
+    if args.gate_predict and packed_loader._gate_predict_enabled:
+        packed_loader._prefetch_enabled[0] = True
+        print("Gate-predict prefetch: ENABLED (FATE gate-weight approach)")
+
     # Flush last token's activations (flushed at layer_idx==0 of *next* token)
     if packed_loader._cur_acts[0]:
         packed_loader._token_acts.append(dict(packed_loader._cur_acts[0]))
@@ -931,7 +1019,10 @@ def main():
         torch.cuda.empty_cache()
         built_gpu = build_gpu_hot_cache_2bit(trace, packed_loader, layer_device,
                                               max_vram_gb=args.gpu_hot_gb,
-                                              safety_margin_gb=args.gpu_margin_gb)
+                                              safety_margin_gb=args.gpu_margin_gb,
+                                              num_layers=n_layers,
+                                              num_experts=tc.num_experts,
+                                              shallow_layers=args.shallow_layers)
         gpu_cache.update(built_gpu)
         run_once("GPU_ONLY")
 

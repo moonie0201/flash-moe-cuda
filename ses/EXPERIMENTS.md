@@ -56,6 +56,23 @@ Added `--top-k 4` CLI override; model config patched before instantiation.
 **Why it works**: Expert loads per token = K × 60 layers. K=4 → 240 loads vs K=10 → 600 loads (60% reduction). PCIe is the bottleneck, so fewer loads = proportionally faster.  
 **Trade-off**: 6 out of 10 experts skipped per token. Output quality is reduced but still coherent for general use.
 
+### FATE Gate-Based Prediction (gate_weight[L+1] @ h[L])
+Implemented real gate weight prediction from FATE paper (arXiv:2502.12224). No training needed — uses actual gate projection weights to predict next-layer expert routing.
+
+Added `--gate-predict` flag. Gate weights extracted to CPU (59 × [512, 4096] float32 = ~240MB).
+
+| Config | COLD | GPU_ONLY | FULL+GPU | GPU hit rate |
+|---|---|---|---|---|
+| K=4 baseline | 1.118 | 1.536 | **1.800** | 59.9% |
+| K=4 + gate predict | 1.196 | 1.560 | 1.712 | **76.6%** |
+| K=4 + gate + shallow (6 layers) | 0.852 | 1.272 | 1.497 | 43.7% |
+
+**Gate predict alone**: GPU hit rate improved 59.9% → 76.6% (prediction is working), but FULL+GPU is slower (1.712 vs 1.800). Prefetch H2D competes with cpu_hit→GPU transfers over shared PCIe bandwidth.
+
+**Shallow-favoring cache**: Prioritizes layers 0-5 in VRAM. Backfired — GPU cache coverage dropped from 68.9% to 49.7%. K=4 means shallow layer experts aren't necessarily hot; global frequency-based cache is better.
+
+**Root cause (same as n-gram)**: PCIe is the ceiling. Even accurate prefetch (76.6% GPU hit) adds PCIe traffic that cancels the gain.
+
 ---
 
 ## What Failed

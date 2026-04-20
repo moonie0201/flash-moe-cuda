@@ -21,6 +21,7 @@ Running **Qwen3.5-397B-A17B** (397 billion parameters) on two consumer GPUs at *
 | GPU cache only | 1.09 | K=10, 6.8GB VRAM cache |
 | **3-tier cache, K=10** | **1.35** | **+17% vs llama.cpp** |
 | **3-tier cache, K=4** | **1.80** | **+57% vs llama.cpp (quality trade-off)** |
+| K=4 + FATE gate predict | 1.71 | Higher GPU hit rate but PCIe still ceiling |
 
 ## How It Works
 
