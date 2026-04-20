@@ -1,0 +1,12 @@
+{
+  "model": "397B bf16",
+  "hot_pct": 0.05,
+  "hot_experts": 1500,
+  "hit_rate": 0.06132617861249521,
+  "hits": 480,
+  "misses": 7347,
+  "tokens": 5,
+  "elapsed_s": 173.6517469882965,
+  "tok_per_s": 0.028793260573053616,
+  "output": "Mixture of Experts ("
+}

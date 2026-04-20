@@ -1,0 +1,41 @@
+# Build artifacts
+metal_infer/infer
+metal_infer/chat
+metal_infer/metal_infer
+metal_infer/bench_pread
+*.o
+*.air
+*.metallib
+
+# Generated model files (recreate with scripts — see CLAUDE.md Quick Start)
+metal_infer/model_weights.bin
+metal_infer/model_weights.json
+metal_infer/vocab.bin
+metal_infer/tokenizer.bin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+*.so
+.python-version
+
+# macOS
+.DS_Store
+
+# Profiling / experiment artifacts
+*.gputrace/
+*.trace/
+*.npz
+logs/
+*.log
+
+# Test binaries and experiment data
+metal_infer/test_lzfse
+metal_infer/repack_experts_lz4
+metal_infer/routing_data.bin
+
+# OMC and virtual environments
+.omc/
+venv/

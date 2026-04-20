@@ -1,0 +1,9 @@
+CC = gcc
+CFLAGS = -O2 -fPIC -shared -Wall -march=native
+LDFLAGS = -lm
+
+libses_kernels.so: ses_kernels.c
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+clean:
+	rm -f libses_kernels.so
