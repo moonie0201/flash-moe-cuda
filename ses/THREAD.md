@@ -2,16 +2,16 @@
 
 ---
 
-**[1/8]**
+**[1/9]**
 I ran a 397 billion parameter LLM on two $300 gaming GPUs.
 
-Not a flex. It took 3 months, 60+ failed experiments, and I still only get 1.35 tok/s.
+Not a flex. It took 3 months, 90+ failed experiments, and I still only get 1.35 tok/s at full quality.
 
 Here's what I learned. 🧵
 
 ---
 
-**[2/8]**
+**[2/9]**
 The model: Qwen3.5-397B-A17B (Mixture of Experts)
 - 60 layers, 512 experts per layer
 - Only 10 experts activate per token
@@ -24,7 +24,7 @@ How do you fit 120GB into 24GB?
 
 ---
 
-**[3/8]**
+**[3/9]**
 You don't. You stream it.
 
 Every token → routing decides which 10 experts to use
@@ -39,14 +39,14 @@ So I built a 3-tier cache:
 ```
 GPU VRAM  (6.8GB)  → 57% hit rate  ← instant
 CPU RAM   (30GB)   → 43% hit rate  ← 0.26ms H2D  
-SSD       (120GB)  →  0.1% hit rate ← 1.3ms
+SSD       (120GB)  →  0.1% miss    ← 1.3ms
 ```
 
-Result: **1.35 tok/s** ✓
+Result: **1.35 tok/s** (+17% vs llama.cpp) ✓
 
 ---
 
-**[4/8]**
+**[4/9]**
 To fit non-expert weights in 24GB across 2 GPUs:
 - Split layers: GPU0 handles layers 0-23, GPU1 handles 24-59
 - Float8 quantize attention weights → freed 7.64GB VRAM
@@ -56,24 +56,42 @@ The kernel alone was worth writing. Replacing 10 serial expert calls with 1 batc
 
 ---
 
-**[5/8]**
+**[5/9]**
+Speed mode: K=4 instead of K=10
+
+The Mac Metal implementation uses K=4 active experts for speed (vs model default K=10).
+
+K=10 → 600 expert loads per token
+K=4  → 240 expert loads per token (60% less)
+
+Since PCIe is the bottleneck, fewer loads = faster token:
+
+**1.80 tok/s at K=4 (+57% vs llama.cpp)**
+
+Trade-off: quality is reduced but still coherent for general use.
+
+---
+
+**[6/9]**
 Things I tried that FAILED:
 
 ❌ Cross-layer n-gram prefetch → -21% (flooded PCIe bandwidth)
-❌ Trained MLP predictor (34K samples) → 25.7% hit rate (not enough)  
+❌ Trained MLP predictor (34K samples) → 25.7% hit@10 (worse with more data)
+❌ FATE gate prediction → GPU hit rate 59.9%→76.6% ✓ but throughput -5% ✗
 ❌ torch.compile → +0.75% (GPU compute wasn't the bottleneck anyway)
-❌ Vectorized H2D → pinned memory + fancy indexing = extra copy overhead
 
 The bottleneck is always PCIe (13 GB/s CPU→GPU).
+Even accurate prediction adds H2D traffic that cancels the gain.
 You can't outrun physics.
 
 ---
 
-**[6/8]**
+**[7/9]**
 How does it compare to llama.cpp?
 
-llama.cpp with Q4_K_M + 3 GPU layers: **1.15 tok/s**
-Our Python implementation: **1.35 tok/s** (+17%)
+llama.cpp (Q4_K_M, 3 GPU layers): **1.15 tok/s**
+3-tier cache, K=10: **1.35 tok/s** (+17%)
+3-tier cache, K=4: **1.80 tok/s** (+57%)
 
 A Python script beating llama.cpp's C++ on the same hardware felt good.
 
@@ -81,7 +99,7 @@ A Python script beating llama.cpp's C++ on the same hardware felt good.
 
 ---
 
-**[7/8]**
+**[8/9]**
 The real lesson:
 
 On discrete GPU + PCIe, **memory bandwidth is destiny**.
@@ -95,14 +113,16 @@ For MoE on consumer hardware: **buy a Mac** or **upgrade VRAM**.
 
 ---
 
-**[8/8]**
-Full code + 60 experiment log on GitHub:
+**[9/9]**
+Full code + 90 experiment log on GitHub:
 → github.com/moonie0201/flash-moe-cuda
 
 Includes:
 - 2-bit expert streaming engine
 - Custom CUDA fused kernel
 - Float8 attention quantization
+- K=4 speed mode
+- FATE gate prediction (and why it didn't help)
 - Everything that failed (and why)
 
 If you're trying to run large MoE models on consumer hardware, hopefully this saves you 3 months.
