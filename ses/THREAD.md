@@ -87,13 +87,12 @@ You can't outrun physics.
 ---
 
 **[7/9]**
-Same hardware throughput (note: different quantization):
+Throughput summary (2-bit quantized, dual RTX 3060):
 
-llama.cpp (Q4_K_M, 4-bit): 1.15 tok/s
-3-tier cache, K=10 (2-bit): 1.35 tok/s
-3-tier cache, K=4 (2-bit): 1.80 tok/s
-
-2-bit is lower quality than 4-bit — not a direct apples-to-apples comparison.
+Cold (no cache), K=10: 0.77 tok/s
+GPU cache only, K=10: 1.09 tok/s
+3-tier cache, K=10: 1.35 tok/s
+3-tier cache, K=4: 1.80 tok/s (quality trade-off)
 
 (Mac M3 Max unified memory: 4.4 tok/s. Unified memory eliminates the PCIe bottleneck entirely.)
 

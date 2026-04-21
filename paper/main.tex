@@ -7,7 +7,7 @@
 \usepackage{algorithm}
 \usepackage{algorithmic}
 
-\title{Running a 397B MoE Model on Dual Consumer GPUs:\\3-Tier Expert Caching Beats llama.cpp by 17\%}
+\title{Running a 397B MoE Model on Dual Consumer GPUs:\\3-Tier Expert Caching Under PCIe Bandwidth Constraints}
 
 \author{
 \IEEEauthorblockN{Anonymous}
@@ -18,7 +18,7 @@
 \maketitle
 
 \begin{abstract}
-Mixture-of-Experts (MoE) models achieve strong performance by activating only a small subset of experts per token, but their massive weight files create severe I/O bottlenecks on consumer hardware. We describe a system for running Qwen3.5-397B-A17B (397 billion parameters, 120GB on disk at 2-bit quantization) on two consumer NVIDIA RTX 3060 GPUs (24GB total VRAM) with 96GB DDR4 RAM. Our 3-tier expert cache---GPU VRAM (57\% hit), CPU pinned RAM (43\% hit), SSD (0.1\% miss)---achieves \textbf{1.35 tokens/second} at K=10, a 17\% improvement over llama.cpp on the same hardware. Reducing active experts to K=4 reaches \textbf{1.80 tokens/second} (+57\% vs llama.cpp). We systematically evaluate prediction-based prefetching (n-gram, MLP, FATE gate weights), and find that all approaches are bounded by the same PCIe Gen3 ceiling of 13~GB/s, explaining why caching dominates prediction for discrete GPU systems. Apple Silicon's 400~GB/s unified memory eliminates this ceiling entirely, achieving 4.4~tok/s on the same model as a reference point.
+Mixture-of-Experts (MoE) models achieve strong performance by activating only a small subset of experts per token, but their massive weight files create severe I/O bottlenecks on consumer hardware. We describe a system for running Qwen3.5-397B-A17B (397 billion parameters, 120GB on disk at 2-bit quantization) on two consumer NVIDIA RTX 3060 GPUs (24GB total VRAM) with 96GB DDR4 RAM. Our 3-tier expert cache---GPU VRAM (57\% hit), CPU pinned RAM (43\% hit), SSD (0.1\% miss)---achieves \textbf{1.35 tokens/second} at K=10. Reducing active experts to K=4 reaches \textbf{1.80 tokens/second} at the cost of output quality. We systematically evaluate prediction-based prefetching (n-gram, MLP, FATE gate weights), and find that all approaches are bounded by the same PCIe Gen3 ceiling of 13~GB/s, explaining why caching dominates prediction for discrete GPU systems. Apple Silicon's 400~GB/s unified memory eliminates this ceiling entirely, achieving 4.4~tok/s on the same model as a reference point.
 \end{abstract}
 
 % ===================================================================
@@ -35,7 +35,7 @@ Our contributions:
 \begin{enumerate}
     \item \textbf{3-tier expert cache}: GPU VRAM (6.8GB, 1980 experts, 57\% hit) + CPU pinned RAM (30GB, 9216 experts, 43\% hit) + SSD (0.1\% miss). Combined 99.9\% cache hit rate.
     \item \textbf{Float8 non-expert quantization}: Reduces non-expert weight VRAM from 19.6GB to 12.0GB (freed 7.64GB), enabling a larger GPU expert cache.
-    \item \textbf{K=4 speed mode}: Reducing active experts from 10 to 4 reduces expert loads from 600 to 240 per token, achieving 1.80~tok/s (+57\% vs llama.cpp).
+    \item \textbf{K=4 speed mode}: Reducing active experts from 10 to 4 reduces expert loads from 600 to 240 per token, achieving 1.80~tok/s with a quality trade-off.
     \item \textbf{Prediction ceiling analysis}: All prefetch approaches (n-gram, MLP, FATE gate prediction) hit the PCIe Gen3 ceiling (13~GB/s CPU$\to$GPU), confirming that caching capacity---not prediction accuracy---is the binding constraint on discrete GPU systems.
 \end{enumerate}
 
@@ -49,7 +49,7 @@ Expert offloading stores expert weights in CPU memory or SSD to overcome VRAM co
 
 \subsection{CPU/GPU Hybrid Inference}
 
-KTransformers~\cite{ktransformers2025} uses CPU/GPU hybrid MoE inference with AMX-optimized kernels. llama.cpp supports partial GPU offloading. Both serve as baselines; our 3-tier cache outperforms llama.cpp by 17\% on the same hardware.
+KTransformers~\cite{ktransformers2025} uses CPU/GPU hybrid MoE inference with AMX-optimized kernels. llama.cpp supports partial GPU offloading for MoE models but does not implement multi-tier expert caching.
 
 \subsection{SSD-Based Inference on Apple Silicon}
 
@@ -116,20 +116,19 @@ SSD expert reads use a 16-worker thread pool, issuing all expert reads for a lay
 \label{tab:main}
 \begin{tabular}{lcc}
 \toprule
-Configuration & tok/s & vs llama.cpp \\
+Configuration & tok/s & Notes \\
 \midrule
-llama.cpp (Q4\_K\_M, 3 GPU layers) & 1.15 & baseline \\
-SSD only, no cache (K=10) & 0.77 & -33\% \\
-GPU VRAM cache only (K=10) & 1.09 & -5\% \\
-\textbf{3-tier cache (K=10)} & \textbf{1.35} & \textbf{+17\%} \\
-\textbf{3-tier cache (K=4)} & \textbf{1.80} & \textbf{+57\%} \\
+SSD only, no cache (K=10) & 0.77 & cold baseline \\
+GPU VRAM cache only (K=10) & 1.09 & 6.8GB VRAM cache \\
+\textbf{3-tier cache (K=10)} & \textbf{1.35} & \textbf{full quality} \\
+\textbf{3-tier cache (K=4)} & \textbf{1.80} & \textbf{speed mode} \\
 \midrule
-\textit{Mac M3 Max (reference)} & \textit{4.4} & \textit{n/a} \\
+\textit{Mac M3 Max (reference)} & \textit{4.4} & \textit{unified memory} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The 3-tier cache at K=10 achieves 1.35~tok/s, 17\% faster than llama.cpp. Reducing K from 10 to 4 cuts expert loads per token from 600 to 240 (60\% reduction), reaching 1.80~tok/s. Apple Silicon's reference result (4.4~tok/s) reflects the unified memory architecture advantage, not a software difference.
+The 3-tier cache at K=10 achieves 1.35~tok/s, a 75\% improvement over the cold SSD baseline (0.77~tok/s). Reducing K from 10 to 4 cuts expert loads per token from 600 to 240 (60\% reduction), reaching 1.80~tok/s with a quality trade-off. Apple Silicon's reference result (4.4~tok/s) reflects the unified memory architecture advantage, not a software difference.
 
 \subsection{Float8 VRAM Analysis}
 
@@ -242,7 +241,7 @@ K=4 reduces expert loads per token from $K \times 60 = 600$ to 240 (60\% reducti
 \section{Conclusion}
 % ===================================================================
 
-We presented a 3-tier expert caching system for running Qwen3.5-397B-A17B on dual consumer RTX 3060 GPUs. The system achieves 1.35~tok/s at K=10 (+17\% vs llama.cpp) and 1.80~tok/s at K=4 (+57\% vs llama.cpp) through frequency-aware caching across GPU VRAM, CPU pinned RAM, and SSD. We find that prediction-based prefetching---despite achieving 76.6\% GPU hit rates via FATE gate prediction---provides no throughput benefit due to PCIe bandwidth contention, establishing PCIe Gen3 as the fundamental ceiling for discrete GPU MoE inference. Apple Silicon's unified memory architecture eliminates this ceiling, representing an architectural advantage that software optimizations cannot fully overcome.
+We presented a 3-tier expert caching system for running Qwen3.5-397B-A17B on dual consumer RTX 3060 GPUs. The system achieves 1.35~tok/s at K=10 and 1.80~tok/s at K=4 (with quality trade-off) through frequency-aware caching across GPU VRAM, CPU pinned RAM, and SSD. We find that prediction-based prefetching---despite achieving 76.6\% GPU hit rates via FATE gate prediction---provides no throughput benefit due to PCIe bandwidth contention, establishing PCIe Gen3 as the fundamental ceiling for discrete GPU MoE inference. Apple Silicon's unified memory architecture eliminates this ceiling, representing an architectural advantage that software optimizations cannot fully overcome.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}

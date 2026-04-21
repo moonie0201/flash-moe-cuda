@@ -1,6 +1,6 @@
 # 397B MoE on Dual RTX 3060 — Linux/CUDA
 
-Running **Qwen3.5-397B-A17B** (397 billion parameters) on two consumer GPUs at **1.35 tok/s** — 17% faster than llama.cpp on the same hardware.
+Running **Qwen3.5-397B-A17B** (397 billion parameters) on two consumer GPUs at **1.35 tok/s** with a 3-tier expert streaming cache.
 
 ## Hardware
 
@@ -16,11 +16,10 @@ Running **Qwen3.5-397B-A17B** (397 billion parameters) on two consumer GPUs at *
 
 | Configuration | tok/s | Notes |
 |---|---|---|
-| llama.cpp (Q4_K_M, 3 GPU layers) | 1.15 | Baseline |
 | SSD only (cold) | 0.77 | K=10, no cache |
 | GPU cache only | 1.09 | K=10, 6.8GB VRAM cache |
-| **3-tier cache, K=10** | **1.35** | **+17% vs llama.cpp** |
-| **3-tier cache, K=4** | **1.80** | **+57% vs llama.cpp (quality trade-off)** |
+| **3-tier cache, K=10** | **1.35** | Full quality |
+| **3-tier cache, K=4** | **1.80** | Speed mode (quality trade-off) |
 | K=4 + FATE gate predict | 1.71 | Higher GPU hit rate but PCIe still ceiling |
 
 ## How It Works

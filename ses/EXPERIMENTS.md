@@ -6,10 +6,9 @@ All experiments on Qwen3.5-397B-A17B, 2-bit quantized, dual RTX 3060 12GB (24GB 
 
 | Configuration | tok/s | Notes |
 |---|---|---|
-| llama.cpp (Q4_K_M, 3 GPU layers) | 1.15 | Best achievable with llama.cpp on this HW |
 | SSD only (cold, no cache) | 0.77 | Streaming every expert from SSD per token |
 | GPU VRAM cache only (6.8GB) | 1.09 | ~1980 experts cached in VRAM |
-| **SES: GPU + CPU + SSD 3-tier** | **1.35** | Final system, +17% vs llama.cpp |
+| **SES: GPU + CPU + SSD 3-tier** | **1.35** | Final system |
 
 ## What Worked
 
