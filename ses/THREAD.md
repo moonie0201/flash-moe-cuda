@@ -87,15 +87,15 @@ You can't outrun physics.
 ---
 
 **[7/9]**
-How does it compare to llama.cpp?
+Same hardware throughput (note: different quantization):
 
-llama.cpp (Q4_K_M, 3 GPU layers): **1.15 tok/s**
-3-tier cache, K=10: **1.35 tok/s** (+17%)
-3-tier cache, K=4: **1.80 tok/s** (+57%)
+llama.cpp (Q4_K_M, 4-bit): 1.15 tok/s
+3-tier cache, K=10 (2-bit): 1.35 tok/s
+3-tier cache, K=4 (2-bit): 1.80 tok/s
 
-A Python script beating llama.cpp's C++ on the same hardware felt good.
+2-bit is lower quality than 4-bit — not a direct apples-to-apples comparison.
 
-(Mac M3 Max with unified memory gets 4.4 tok/s. Unified memory is cheating.)
+(Mac M3 Max unified memory: 4.4 tok/s. Unified memory eliminates the PCIe bottleneck entirely.)
 
 ---
 
@@ -109,7 +109,7 @@ Every clever trick (prefetch, prediction, compression) runs into the same wall:
 
 Apple Silicon wins because 400 GB/s unified memory eliminates the wall entirely.
 
-For MoE on consumer hardware: **buy a Mac** or **upgrade VRAM**.
+For large MoE on discrete GPU: more VRAM or more RAM is more effective than better software.
 
 ---
 
